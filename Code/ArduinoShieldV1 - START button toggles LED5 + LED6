@@ -1,0 +1,66 @@
+// ArduinoShieldV1 - START button toggles LED5 + LED6
+// 1st press -> LED5 and LED6 ON
+// 2nd press -> LED5 and LED6 OFF
+//
+// Pins (as per schematic):
+//   START button -> D11 (other side to GND)
+//   LED5         -> D12
+//   LED6         -> D10
+
+const int START_BTN = 11;
+const int LED5 = 12;
+const int LED6 = 10;
+
+const unsigned long DEBOUNCE_MS = 50;
+
+bool ledState = false;          // false = OFF, true = ON
+
+bool lastReading;               // last raw reading of button
+bool stableState;               // debounced button state
+unsigned long lastChange = 0;   // time of last raw change
+
+// Returns true only once, at the moment the button is pressed
+bool startPressed() {
+  bool reading = digitalRead(START_BTN);
+
+  if (reading != lastReading) {
+    lastChange = millis();
+    lastReading = reading;
+  }
+
+  if ((millis() - lastChange) > DEBOUNCE_MS && reading != stableState) {
+    stableState = reading;
+    if (stableState == LOW) {   // LOW = pressed (INPUT_PULLUP)
+      return true;
+    }
+  }
+  return false;
+}
+
+void setLeds(bool on) {
+  digitalWrite(LED5, on ? HIGH : LOW);
+  digitalWrite(LED6, on ? HIGH : LOW);
+}
+
+void setup() {
+  pinMode(START_BTN, INPUT_PULLUP);
+  pinMode(LED5, OUTPUT);
+  pinMode(LED6, OUTPUT);
+
+  setLeds(false);               // LEDs OFF at power-on
+
+  // Read the real button state at startup so no false press happens
+  lastReading = digitalRead(START_BTN);
+  stableState = lastReading;
+
+  Serial.begin(9600);
+  Serial.println("Ready - press START button");
+}
+
+void loop() {
+  if (startPressed()) {
+    ledState = !ledState;       // toggle
+    setLeds(ledState);
+    Serial.println(ledState ? "LED5 + LED6 ON" : "LED5 + LED6 OFF");
+  }
+}
