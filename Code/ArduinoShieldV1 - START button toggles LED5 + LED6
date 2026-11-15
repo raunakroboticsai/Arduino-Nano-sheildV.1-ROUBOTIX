@@ -1,38 +1,35 @@
-// ArduinoShieldV1 - START button toggles LED5 + LED6
-// 1st press -> LED5 and LED6 ON
-// 2nd press -> LED5 and LED6 OFF
-//
-// Pins (as per schematic):
-//   START button -> D11 (other side to GND)
-//   LED5         -> D12
-//   LED6         -> D10
+// ArduinoShieldV1 - CALIB + START buttons
+// CALIB (D13): 1st press -> LED5 + LED6 ON, 2nd press -> OFF
+// START (D11): 1st press -> LED5 + LED6 ON, 2nd press -> OFF
 
+const int CALIB_BTN = 13;
 const int START_BTN = 11;
 const int LED5 = 12;
 const int LED6 = 10;
 
 const unsigned long DEBOUNCE_MS = 50;
 
-bool ledState = false;          // false = OFF, true = ON
+bool ledState = false;
 
-bool lastReading;               // last raw reading of button
-bool stableState;               // debounced button state
-unsigned long lastChange = 0;   // time of last raw change
+struct Button {
+  int pin;
+  bool lastReading;
+  bool stableState;
+  unsigned long lastChange;
+};
 
-// Returns true only once, at the moment the button is pressed
-bool startPressed() {
-  bool reading = digitalRead(START_BTN);
+Button calibBtn = {CALIB_BTN, HIGH, HIGH, 0};
+Button startBtn = {START_BTN, HIGH, HIGH, 0};
 
-  if (reading != lastReading) {
-    lastChange = millis();
-    lastReading = reading;
+bool wasPressed(Button &b) {
+  bool reading = digitalRead(b.pin);
+  if (reading != b.lastReading) {
+    b.lastChange = millis();
+    b.lastReading = reading;
   }
-
-  if ((millis() - lastChange) > DEBOUNCE_MS && reading != stableState) {
-    stableState = reading;
-    if (stableState == LOW) {   // LOW = pressed (INPUT_PULLUP)
-      return true;
-    }
+  if ((millis() - b.lastChange) > DEBOUNCE_MS && reading != b.stableState) {
+    b.stableState = reading;
+    if (b.stableState == LOW) return true;
   }
   return false;
 }
@@ -43,24 +40,33 @@ void setLeds(bool on) {
 }
 
 void setup() {
+  pinMode(CALIB_BTN, INPUT_PULLUP);
   pinMode(START_BTN, INPUT_PULLUP);
   pinMode(LED5, OUTPUT);
   pinMode(LED6, OUTPUT);
+  setLeds(false);
 
-  setLeds(false);               // LEDs OFF at power-on
-
-  // Read the real button state at startup so no false press happens
-  lastReading = digitalRead(START_BTN);
-  stableState = lastReading;
+  delay(100);
+  calibBtn.lastReading = calibBtn.stableState = digitalRead(CALIB_BTN);
+  startBtn.lastReading = startBtn.stableState = digitalRead(START_BTN);
 
   Serial.begin(9600);
-  Serial.println("Ready - press START button");
+  Serial.println("Ready - press CALIB or START");
 }
 
 void loop() {
-  if (startPressed()) {
-    ledState = !ledState;       // toggle
+  bool calib = wasPressed(calibBtn);
+  bool start = wasPressed(startBtn);
+
+  if (calib) {
+    ledState = !ledState;
     setLeds(ledState);
-    Serial.println(ledState ? "LED5 + LED6 ON" : "LED5 + LED6 OFF");
+    Serial.println(ledState ? "CALIB: LEDs ON" : "CALIB: LEDs OFF");
+  }
+
+  if (start) {
+    ledState = !ledState;
+    setLeds(ledState);
+    Serial.println(ledState ? "START: LEDs ON" : "START: LEDs OFF");
   }
 }
