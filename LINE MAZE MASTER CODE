@@ -1,0 +1,1560 @@
+// =====================================================================
+//
+//        LINE MAZE SOLVER  -  MASTER CODE  (multi-algorithm)
+//        Arduino Nano + ArduinoShieldV1 + 2x TB6612FNG + 5 IR sensors
+//
+// =====================================================================
+//
+//  ONE program, FIVE maze-solving algorithms. Choose one by changing
+//  `algorithmMode` in SECTION 1 below - nothing else needs to change.
+//
+//  +------+----------------------------+-----------------------------------+
+//  | mode | Algorithm                  | How it works                      |
+//  +------+----------------------------+-----------------------------------+
+//  |  0   | LEFT-HAND RULE             | Always prefer Left > Straight >   |
+//  |      | (wall follower)            | Right. Records every decision,    |
+//  |      |                            | then removes dead-end detours     |
+//  |      |                            | ("path simplification").          |
+//  +------+----------------------------+-----------------------------------+
+//  |  1   | RIGHT-HAND RULE            | Same, but Right > Straight > Left.|
+//  |      | (wall follower)            |                                   |
+//  +------+----------------------------+-----------------------------------+
+//  |  2   | DIJKSTRA                   | Builds a MAP (junctions + lines + |
+//  |      | (map until END found)      | driving time) while exploring.    |
+//  |      |                            | Never circles a loop. When END is |
+//  |      |                            | found, Dijkstra computes the      |
+//  |      |                            | fastest route over that map.      |
+//  +------+----------------------------+-----------------------------------+
+//  |  3   | TREMAUX FULL EXPLORATION   | Like mode 2, but does NOT stop at |
+//  |      | + DIJKSTRA                 | END: it explores EVERY line of the|
+//  |      |                            | maze first (depth-first, Tremaux).|
+//  |      |                            | Slower dry run, but the final run |
+//  |      |                            | is GUARANTEED the shortest route. |
+//  +------+----------------------------+-----------------------------------+
+//  |  4   | FULL EXPLORATION + A*      | Same full map as mode 3, planned  |
+//  |      | (A-star search)            | with A*: Dijkstra + a distance-   |
+//  |      |                            | to-END "hint". Same answer, fewer |
+//  |      |                            | search steps (see Serial Monitor).|
+//  +------+----------------------------+-----------------------------------+
+//
+//  Which one should I use?
+//    - Wall followers (0, 1): simplest to understand. They can get stuck
+//      circling a LOOP in mazes that have loops, and the final route is
+//      not always the shortest.
+//    - Dijkstra (2): fast dry run, loop-safe, shortest route over what
+//      the robot has seen.
+//    - Full exploration (3, 4): longest dry run, but the true shortest
+//      route of the whole maze. The map uses driving TIME as distance,
+//      so keep the speed steady (charged battery, same lfspeed) during
+//      the dry run.
+//
+//  HOW TO RUN (all modes)
+//    1. Press CALIB  -> bot spins and calibrates sensors, impeller starts
+//    2. Press START  -> DRY RUN (explores the maze)
+//                       Both LEDs blink when the dry run is finished.
+//    3. Put the robot back on START.
+//       Press START  -> FINAL RUN (follows the computed path)
+//       Press START again to repeat the final run.
+//       Press CALIB any time here to re-calibrate (the path is kept).
+//    Open Serial Monitor (9600 baud) to see the map and the path.
+//
+//  PIN MAP (ArduinoShieldV1)
+//    Motor A (LEFT)  : AIN1 = D4, AIN2 = D2, PWMA = D5
+//    Motor B (RIGHT) : BIN1 = D7, BIN2 = D8, PWMB = D6
+//    (STBY is tied HIGH on the shield)
+//    CALIB button    : D13 (pressed = LOW)     START button : D11
+//    LED5            : D12                     LED6         : D10
+//    Impeller (ESC)  : D3                      Line sensors : A0..A4
+//      A0 = far left, A1 = left, A2 = centre, A3 = right, A4 = far right
+//
+//  FILE LAYOUT
+//    SECTION 1  : user settings  (algorithm, arena colour, speeds, tuning)
+//    SECTION 2  : pins + motor driver
+//    SECTION 3  : global variables
+//    SECTION 4  : sensors + calibration
+//    SECTION 5  : line following, PID, junction detection
+//    SECTION 6  : movement (turns, brakes)
+//    SECTION 7  : LEDs + buttons
+//    SECTION 8  : ALGORITHMS 0 + 1   (wall followers + path simplification)
+//    SECTION 9  : ALGORITHMS 2,3,4   (maze map + exploration)
+//    SECTION 10 : PLANNERS           (Dijkstra and A*)
+//    SECTION 11 : dry run, final run, setup(), loop()
+// =====================================================================
+
+
+// =====================================================================
+//  SECTION 1 : USER SETTINGS
+// =====================================================================
+
+// ---------------- ALGORITHM  <<< STUDENTS: CHANGE THIS >>> ----------
+//   0 = Left-Hand Rule          1 = Right-Hand Rule
+//   2 = Dijkstra                3 = Tremaux full exploration + Dijkstra
+//   4 = Full exploration + A*
+int algorithmMode = 2;
+
+#define ALGO_LEFT_HAND   0
+#define ALGO_RIGHT_HAND  1
+#define ALGO_DIJKSTRA    2
+#define ALGO_TREMAUX     3
+#define ALGO_ASTAR       4
+
+// For modes 2, 3, 4: which side to try first when exploring a new junction
+//   1 = right first (like Right-Hand Rule), 0 = left first
+#define EXPLORE_RIGHT_FIRST 1
+
+// ---------------- ARENA  <<< CHANGE FOR EACH ARENA >>> ---------------
+//   mode = 1 : BLACK line on WHITE background
+//   mode = 0 : WHITE line on BLACK background
+int mode = 0;
+
+// Sensor hardware type - set ONCE for your sensor board, then leave it.
+//   1 = sensor gives a LOW reading on WHITE (normal analog IR / TCRT5000)
+//   0 = sensor gives a LOW reading on BLACK
+#define SENSOR_WHITE_IS_LOW 1
+
+// ---------------- Speeds + PID ----------------
+int   lfspeed   = 80;     // line-following speed (0-255)
+int   turnspeed = 65;     // spin speed for turns (0-255)
+float Kp = 0.04;
+float Kd = 0.05;
+float Ki = 0;
+int   FT = 150;           // junction scan length (loop steps)
+
+// ---------------- Impeller ----------------
+#define IMPELLER_PIN 3
+#define IMPELLER_PWM 20
+
+// ---------------- Dead-end HARD BRAKE ----------------
+// At a dead end: short reverse pulse + TB6612 short brake, then U-turn.
+#define BRAKE_REVERSE_PWM 150   // strength of the reverse pulse (0-255)
+#define BRAKE_REVERSE_MS  40    // rolls back? -> lower.  overshoots? -> raise (50-70)
+#define BRAKE_HOLD_MS     80    // short-brake hold time before the turn
+
+// ---------------- SOFT BRAKE for turns ----------------
+// As soon as a turn / junction is detected the bot smoothly slows down.
+#define SOFT_BRAKE_TURNS 1      // 1 = on, 0 = off
+#define SOFT_BRAKE_PCT   60     // slow down to this % of lfspeed
+#define SOFT_BRAKE_RAMP  30     // ramp length in loop steps
+
+// ---------------- END confirmation ----------------
+// Stops a + crossing (cross-line) from being taken as the END zone.
+#define END_CONFIRM      1
+#define END_CONFIRM_MS   150    // must stay on line colour this long to be END
+
+// ---------------- Junction handling ----------------
+#define CLEAR_JUNCTION_MS 300   // max time to drive off a cross-line after going straight
+
+// ---------------- Leaving the END zone (modes 3, 4 only) ----------------
+// Full exploration may need to drive OUT of the END zone to explore the rest.
+#define END_BACKOUT_MS   250    // extra reverse time after leaving the END zone
+
+// ---------------- Safety limits ----------------
+#define MAX_DECISIONS    250    // dry run gives up after this many junctions
+                                //   (stops a wall follower circling a loop forever)
+
+// ---------------- Map tuning (modes 2, 3, 4) ----------------
+// Distances are measured in milliseconds of line following at lfspeed.
+#define MAX_NODES        36     // max junctions + line ends the map can store
+#define NODE_TOL_MS      150    // how close a position must be to count as the same junction
+#define NODE_TOL_PCT     15     // + 15% of distance driven since that junction was last seen
+#define NODE_TOL_MAX     6      // tolerance never grows above 6 x NODE_TOL_MS
+#define CORNER_COST_MS   350    // extra time a plain 90 deg bend costs
+#define TURN_COST_MS     450    // extra time a L/R turn at a junction costs in the final run
+#define JUNCTION_COST_MS 100    // extra time any junction costs
+#define SHORTCUT_RATIO   15     // test a possible short cut if known route > 1.5x straight distance
+#define ALIGN_TOL_MS     90     // max sideways offset for two junctions to be "in line"
+#define ASTAR_HINT_PCT   90     // A* hint strength in % (<=100 keeps A* exact)
+
+#define MAP_DEBUG        1      // print map + path on Serial after the dry run
+
+
+// =====================================================================
+//  SECTION 2 : PINS + MOTOR DRIVER
+// =====================================================================
+#define CALIB_BTN 13
+#define START_BTN 11
+#define LED5      12
+#define LED6      10
+
+#define AIN1 4
+#define AIN2 2
+#define PWMA 5
+#define BIN1 7
+#define BIN2 8
+#define PWMB 6
+
+// set to -1 if a motor runs the wrong way
+const int offsetA = 1;
+const int offsetB = 1;
+
+// Small TB6612 driver: drive(+speed) = forward, drive(-speed) = backward
+class Motor {
+  public:
+    Motor(uint8_t in1, uint8_t in2, uint8_t pwm, int8_t offset)
+      : _in1(in1), _in2(in2), _pwm(pwm), _offset(offset) {}
+
+    void begin() {
+      pinMode(_in1, OUTPUT);
+      pinMode(_in2, OUTPUT);
+      pinMode(_pwm, OUTPUT);
+      digitalWrite(_in1, LOW);
+      digitalWrite(_in2, LOW);
+      analogWrite(_pwm, 0);
+    }
+
+    void drive(int speed) {
+      speed = speed * _offset;
+      if (speed > 255)  speed = 255;
+      if (speed < -255) speed = -255;
+      if (speed >= 0) {
+        digitalWrite(_in1, HIGH);
+        digitalWrite(_in2, LOW);
+        analogWrite(_pwm, speed);
+      } else {
+        digitalWrite(_in1, LOW);
+        digitalWrite(_in2, HIGH);
+        analogWrite(_pwm, -speed);
+      }
+    }
+
+    void brake() {                 // TB6612 short brake
+      digitalWrite(_in1, HIGH);
+      digitalWrite(_in2, HIGH);
+      analogWrite(_pwm, 0);
+    }
+
+  private:
+    uint8_t _in1, _in2, _pwm;
+    int8_t  _offset;
+};
+
+// motor1 = Motor A = LEFT, motor2 = Motor B = RIGHT
+Motor motor1 = Motor(AIN1, AIN2, PWMA, offsetA);
+Motor motor2 = Motor(BIN1, BIN2, PWMB, offsetB);
+
+
+// =====================================================================
+//  SECTION 3 : GLOBAL VARIABLES
+// =====================================================================
+
+// What checknode() saw at the last junction (1 = yes)
+bool l = 0;      // line to the LEFT
+bool r = 0;      // line to the RIGHT
+bool s = 0;      // line STRAIGHT ahead
+bool u = 0;      // dead end (no line at all)
+bool x = 0;
+bool y = 0;
+int  e = 0;      // 2 = END zone
+int  paths = 0;  // number of lines leaving this point (l + s + r)
+
+bool endFound = 0;        // dry run finished
+bool dryRunFailed = false;
+int  decisionCount = 0;   // junction decisions made in this dry run
+
+int P, D, I, previousError, PIDvalue, error;
+int lsp = 150;
+int rsp = 150;
+
+// The path: one letter per junction, e.g. "RRLSE"
+//   L = left, S = straight, R = right, U = U-turn (dead end), E = END
+String str;
+
+int minValues[8], maxValues[8], threshold[8];
+
+// ---- maze map (used by modes 2, 3, 4) ----
+#define NO_NODE      255
+#define NT_JUNCTION  0
+#define NT_DEADEND   1
+#define NT_END       2
+
+struct MapNode {
+  int16_t  px, py;      // dead-reckoned position (ms of driving)
+  uint8_t  exits;       // bit d set = a line leaves this node in absolute direction d
+  uint8_t  type;        // NT_JUNCTION / NT_DEADEND / NT_END
+  uint8_t  nbr[4];      // node reached through exit d (NO_NODE = not explored yet)
+  uint8_t  arrH;        // 2 bits per exit: heading when arriving at that neighbour
+  uint16_t cost[4];     // driving time of the line through exit d
+  uint16_t seenOdo;     // odometer/8 when this node was last visited
+};
+
+MapNode  nodes[MAX_NODES];
+uint8_t  nodeCount = 0;
+uint8_t  curNode = NO_NODE;   // node we left last
+uint8_t  curExit = 0;         // absolute exit we left it by
+// heading: 0 = start direction, 1 = right of it, 2 = back, 3 = left of it
+uint8_t  heading = 0;
+uint8_t  endNode = NO_NODE;
+int32_t  posX = 0, posY = 0;
+uint32_t odoMs = 0, edgeMs = 0, segStartMs = 0;
+bool     mappingActive = false;
+bool     mapBroken = false;
+uint8_t  verifyTarget = NO_NODE;  // junction we expect to reach while testing a short cut
+uint8_t  verifyOrigin = NO_NODE;  // junction the short-cut test started from
+uint8_t  returnTo = NO_NODE;      // failed test: drive back here
+bool     verifyBent = false;
+uint16_t plannerSteps = 0;        // how many states the planner looked at
+
+const int8_t DIRX[4] = {0, 1, 0, -1};
+const int8_t DIRY[4] = {1, 0, -1, 0};
+
+// ---- prototypes (keeps the Arduino IDE happy) ----
+int     readS(uint8_t ch);
+void    calib(); void checknode(); void linefollow(); void PID(); void reposition();
+void    red(); void blue(); void lightsoff(); void endBlink(); void errorBlink();
+void    botleft(); void botright(); void botstraight(); void botstop(); void botuturn();
+void    hardBrake(); void clearJunction(); void followCorner();
+void    waitPress(uint8_t pin); uint8_t waitAnyPress();
+bool    useLeftHand(); void wallFollowerStep(); void simplifyPath();
+int     turnAngle(char c); char angleToTurn(int a);
+void    mapInit(); void mapReposition(); bool fullExploreMode();
+bool    explorationComplete(); void finishDryRun(); void backOutOfEnd();
+uint8_t registerNode(uint8_t type, uint8_t ex, uint8_t back, bool *isNew);
+void    linkEdge(uint8_t a, uint8_t da, uint8_t b, uint8_t db, uint32_t c, uint8_t hArr);
+uint8_t getArr(uint8_t n, uint8_t d);
+uint32_t nodeTol(uint8_t j);
+uint8_t chooseExit(uint8_t n);
+uint8_t shortcutTarget(uint8_t n, uint8_t d);
+bool    aheadAligned(uint8_t n, uint8_t d, uint8_t m);
+uint32_t graphDist(uint8_t from, uint8_t to, uint8_t *firstExit);
+void    turnToDir(uint8_t d, uint8_t ex);
+void    spinRightLines(uint8_t count);
+bool    planShortestPath(bool useAStar);
+void    printMap();
+void    dryRun(); void buildFinalPath(); void finalRun();
+
+
+// =====================================================================
+//  SECTION 4 : SENSORS + CALIBRATION
+// =====================================================================
+
+// readS(): every sensor read goes through this. It always returns a value
+// where LINE = LOW and BACKGROUND = HIGH, whatever the arena colour is.
+// So calibration, PID and junction detection work the same in both arenas.
+int readS(uint8_t ch) {
+  int v = analogRead(ch);
+  bool lineIsWhite = (mode == 0);
+  bool lineReadsLow = lineIsWhite ? (SENSOR_WHITE_IS_LOW == 1)
+                                  : (SENSOR_WHITE_IS_LOW == 0);
+  return lineReadsLow ? v : (1023 - v);
+}
+
+// Spin on the spot and record the min / max value of every sensor.
+// threshold = halfway between line and background.
+void calib() {
+  blue();                                   // LED6 on while calibrating
+  for (int i = 0; i < 5; i++) {
+    minValues[i] = readS(i);
+    maxValues[i] = readS(i);
+  }
+
+  for (int i = 0; i < 3000; i++) {
+    motor1.drive(60);
+    motor2.drive(-60);
+
+    for (int i = 0; i < 5; i++) {
+      if (readS(i) < minValues[i]) minValues[i] = readS(i);
+      if (readS(i) > maxValues[i]) maxValues[i] = readS(i);
+    }
+  }
+
+  for (int i = 0; i < 5; i++) {
+    threshold[i] = (minValues[i] + maxValues[i]) / 2;
+    Serial.print(threshold[i]);
+    Serial.print("   ");
+  }
+  Serial.println();
+
+  motor1.drive(0);
+  motor2.drive(0);
+  lightsoff();
+}
+
+
+// =====================================================================
+//  SECTION 5 : LINE FOLLOWING, PID, JUNCTION DETECTION
+// =====================================================================
+
+// Follow the line until something happens: a side sensor sees a line
+// (junction / turn / END) or every sensor loses the line (dead end).
+void linefollow() {
+  paths = 0;
+  while ((readS(0) > threshold[0]) &&
+         (readS(4) > threshold[4]) &&
+         (readS(1) < threshold[1] ||
+          readS(2) < threshold[2] ||
+          readS(3) < threshold[3])) {
+    PID();
+  }
+  lightsoff();
+}
+
+// PID steering: error = left sensor - right sensor
+void PID() {
+  int error = readS(1) - readS(3);
+
+  P = error;
+  I = I + error;
+  D = error - previousError;
+
+  PIDvalue = (Kp * P) + (Ki * I) + (Kd * D);
+  previousError = error;
+
+  lsp = lfspeed - PIDvalue;
+  rsp = lfspeed + PIDvalue;
+
+  if (lsp > 255) lsp = 255;
+  if (lsp < 0)   lsp = 0;
+  if (rsp > 255) rsp = 255;
+  if (rsp < 0)   rsp = 0;
+
+  motor1.drive(rsp);
+  motor2.drive(lsp);
+}
+
+// Look at the junction and fill in l, s, r, u, e and paths.
+void checknode() {
+  lightsoff();
+  l = 0; r = 0; x = 0; y = 0; s = 0; u = 0; e = 0;
+  paths = 0;
+
+  // ---- dead end: no line under any sensor ----
+  if ((readS(0) > threshold[0]) &&
+      (readS(4) > threshold[4]) &&
+      (readS(2) > threshold[2])) {
+    u = 1;
+    hardBrake();                         // stop right here
+  }
+
+  if (u == 0) {
+#if SOFT_BRAKE_TURNS
+    // SOFT BRAKE: smoothly slow down while scanning the junction
+    int baseSpeed = lfspeed;
+    int slowSpeed = (long)lfspeed * SOFT_BRAKE_PCT / 100;
+#endif
+    // ---- scan: drive forward a little and look left / right ----
+    for (int i = 0; i < FT; i++) {
+#if SOFT_BRAKE_TURNS
+      if (i < SOFT_BRAKE_RAMP)
+        lfspeed = baseSpeed - (long)(baseSpeed - slowSpeed) * (i + 1) / SOFT_BRAKE_RAMP;
+#endif
+      PID();
+      if (readS(0) < threshold[0]) l = 1;
+      if (readS(4) < threshold[4]) r = 1;
+    }
+#if SOFT_BRAKE_TURNS
+    lfspeed = baseSpeed;                 // back to normal speed
+#endif
+
+    // ---- is there a line straight ahead?  is this the END zone? ----
+    if (readS(2) < threshold[2]) s = 1;
+    if ((readS(0) < threshold[0]) &&
+        (readS(4) < threshold[4]) &&
+        (readS(2) < threshold[2])) e = 2;
+
+#if END_CONFIRM
+    // A + crossing can look like the END for a moment. The real END is a
+    // big area: the sensors stay on it while moving ahead. A cross-line
+    // is thin: the outer sensors reach the background quickly.
+    if (e == 2) {
+      unsigned long t0 = millis();
+      while (millis() - t0 < END_CONFIRM_MS) {
+        PID();
+        if (readS(0) > threshold[0] || readS(4) > threshold[4]) {
+          e = 0;                         // NOT the end: it is a junction
+          break;
+        }
+      }
+      if (e == 0) {
+        s = (readS(2) < threshold[2]) ? 1 : 0;
+      }
+    }
+#endif
+  }
+
+  paths = l + s + r;
+}
+
+
+// =====================================================================
+//  SECTION 6 : MOVEMENT (turns, brakes)
+// =====================================================================
+
+// Turn LEFT on the spot until the centre sensor finds the new line.
+// If a straight line is under the centre sensor, rotate OFF it first,
+// otherwise the bot would "find" that straight line again.
+void botleft() {
+  int offLevel = (threshold[2] + maxValues[2]) / 2;
+  bool leftLine = (readS(2) >= threshold[2]);       // already off the line?
+  unsigned long t0 = millis();
+  while (millis() - t0 < 150) {
+    motor1.drive(-1 * turnspeed);
+    motor2.drive(turnspeed);
+    if (readS(2) > offLevel) leftLine = true;
+  }
+  while (!leftLine) {                               // still on the straight line
+    motor1.drive(-1 * turnspeed);
+    motor2.drive(turnspeed);
+    if (readS(2) > offLevel) leftLine = true;
+  }
+  while (readS(2) > threshold[2]) {                 // find the new line
+    motor1.drive(-1 * turnspeed);
+    motor2.drive(turnspeed);
+  }
+  motor1.drive(0);
+  motor2.drive(0);
+  delay(50);
+}
+
+// Turn RIGHT on the spot (same idea as botleft)
+void botright() {
+  int offLevel = (threshold[2] + maxValues[2]) / 2;
+  bool leftLine = (readS(2) >= threshold[2]);
+  unsigned long t0 = millis();
+  while (millis() - t0 < 250) {
+    motor1.drive(turnspeed);
+    motor2.drive(-1 * turnspeed);
+    if (readS(2) > offLevel) leftLine = true;
+  }
+  while (!leftLine) {
+    motor1.drive(turnspeed);
+    motor2.drive(-1 * turnspeed);
+    if (readS(2) > offLevel) leftLine = true;
+  }
+  while (readS(2) > threshold[2]) {
+    motor1.drive(turnspeed);
+    motor2.drive(-1 * turnspeed);
+  }
+  motor1.drive(0);
+  motor2.drive(0);
+  delay(50);
+}
+
+// U-turn (dead end). If the centre sensor starts ON a line (only when
+// leaving the END zone in modes 3/4) it first rotates off that line.
+void botuturn() {
+  int offLevel = (threshold[2] + maxValues[2]) / 2;
+  bool leftLine = (readS(2) >= threshold[2]);
+  unsigned long t0 = millis();
+  while (millis() - t0 < 200) {
+    motor1.drive(-1 * lfspeed);
+    motor2.drive(lfspeed);
+    if (readS(2) > offLevel) leftLine = true;
+  }
+  while (!leftLine) {
+    motor1.drive(-1 * turnspeed);
+    motor2.drive(turnspeed);
+    if (readS(2) > offLevel) leftLine = true;
+  }
+  while (readS(2) > threshold[2]) {
+    motor1.drive(-1 * turnspeed);
+    motor2.drive(turnspeed);
+  }
+  motor1.drive(0);
+  motor2.drive(0);
+  delay(50);
+}
+
+void botstraight() {
+  motor1.drive(lfspeed);
+  motor2.drive(lfspeed);
+}
+
+void botstop() {
+  motor1.drive(0);
+  motor2.drive(0);
+}
+
+// Hard brake: reverse pulse + short brake (used at dead ends)
+void hardBrake() {
+  motor1.drive(-BRAKE_REVERSE_PWM);
+  motor2.drive(-BRAKE_REVERSE_PWM);
+  delay(BRAKE_REVERSE_MS);
+  motor1.brake();
+  motor2.brake();
+  delay(BRAKE_HOLD_MS);
+  motor1.drive(0);
+  motor2.drive(0);
+}
+
+// After going STRAIGHT through a junction, keep line-following until the
+// outer sensors have left the cross-line, so the same junction is never
+// counted twice. Used in the dry run AND the final run.
+void clearJunction() {
+  unsigned long t0 = millis();
+  while ((readS(0) < threshold[0] || readS(4) < threshold[4]) &&
+         millis() - t0 < CLEAR_JUNCTION_MS) {
+    PID();
+  }
+}
+
+// A plain bend (only ONE way to go): just take it. Not a decision.
+void followCorner() {
+  if (r == 1)      botright();
+  else if (s == 1) { }
+  else if (l == 1) botleft();
+}
+
+// Spin right until the centre sensor has reached 'count' lines.
+void spinRightLines(uint8_t count) {
+  int offLevel = (threshold[2] + maxValues[2]) / 2;            // hysteresis
+  motor1.drive(turnspeed);
+  motor2.drive(-1 * turnspeed);
+  while (readS(2) < offLevel) {                                // leave the line we stand on
+    motor1.drive(turnspeed);
+    motor2.drive(-1 * turnspeed);
+  }
+  for (uint8_t k = 0; k < count; k++) {
+    while (readS(2) > threshold[2]) {                          // wait for next line
+      motor1.drive(turnspeed);
+      motor2.drive(-1 * turnspeed);
+    }
+    if (k + 1 < count) {
+      while (readS(2) < offLevel) {                            // pass over it
+        motor1.drive(turnspeed);
+        motor2.drive(-1 * turnspeed);
+      }
+    }
+  }
+  motor1.drive(0);
+  motor2.drive(0);
+  delay(50);
+}
+
+
+// =====================================================================
+//  SECTION 7 : LEDs + BUTTONS
+// =====================================================================
+void red()  { digitalWrite(LED5, HIGH); }
+void blue() { digitalWrite(LED6, HIGH); }
+
+void lightsoff() {
+  digitalWrite(LED5, LOW);
+  digitalWrite(LED6, LOW);
+}
+
+// END / dry run finished: both LEDs blink together
+#define END_BLINK_COUNT 10
+#define END_BLINK_MS    250
+void endBlink() {
+  for (int i = 0; i < END_BLINK_COUNT; i++) {
+    digitalWrite(LED5, HIGH);
+    digitalWrite(LED6, HIGH);
+    delay(END_BLINK_MS);
+    digitalWrite(LED5, LOW);
+    digitalWrite(LED6, LOW);
+    delay(END_BLINK_MS);
+  }
+}
+
+// Something went wrong: LEDs blink alternately (fast)
+void errorBlink() {
+  for (int i = 0; i < 20; i++) {
+    digitalWrite(LED5, HIGH);
+    digitalWrite(LED6, LOW);
+    delay(100);
+    digitalWrite(LED5, LOW);
+    digitalWrite(LED6, HIGH);
+    delay(100);
+  }
+  lightsoff();
+}
+
+// waits for a full press + release of 'pin' (active LOW, debounced)
+void waitPress(uint8_t pin) {
+  while (true) {
+    while (digitalRead(pin) == HIGH) {}
+    delay(30);
+    if (digitalRead(pin) == LOW) break;
+  }
+  while (digitalRead(pin) == LOW) {}
+  delay(30);
+}
+
+// waits for CALIB or START, returns the pin that was pressed
+uint8_t waitAnyPress() {
+  while (true) {
+    if (digitalRead(CALIB_BTN) == LOW) {
+      delay(30);
+      if (digitalRead(CALIB_BTN) == LOW) {
+        while (digitalRead(CALIB_BTN) == LOW) {}
+        delay(30);
+        return CALIB_BTN;
+      }
+    }
+    if (digitalRead(START_BTN) == LOW) {
+      delay(30);
+      if (digitalRead(START_BTN) == LOW) {
+        while (digitalRead(START_BTN) == LOW) {}
+        delay(30);
+        return START_BTN;
+      }
+    }
+  }
+}
+
+
+// =====================================================================
+//  SECTION 8 : ALGORITHMS 0 + 1  -  WALL FOLLOWERS
+// =====================================================================
+//  At every junction the robot picks a direction by a fixed priority:
+//     Left-Hand Rule  : Left  > Straight > Right > U-turn
+//     Right-Hand Rule : Right > Straight > Left  > U-turn
+//  Every junction decision is written into `str` ('U' = dead end).
+//  After the dry run, simplifyPath() removes all the dead-end detours.
+// ---------------------------------------------------------------------
+
+// Which hand to follow? (modes 2-4 also use this as a fallback)
+bool useLeftHand() {
+  if (algorithmMode == ALGO_LEFT_HAND)  return true;
+  if (algorithmMode == ALGO_RIGHT_HAND) return false;
+  return (EXPLORE_RIGHT_FIRST == 0);
+}
+
+// One dry-run decision of the wall follower
+void wallFollowerStep() {
+  // ---- END zone ----
+  if (e == 2) {
+    str += 'E';
+    finishDryRun();
+    return;
+  }
+
+  // ---- dead end: turn back ----
+  if (u == 1) {
+    str += 'U';
+    botuturn();
+    heading = (heading + 2) & 3;
+    return;
+  }
+
+  // ---- choose by hand priority ----
+  char c;
+  if (useLeftHand()) {
+    if (l == 1)      c = 'L';
+    else if (s == 1) c = 'S';
+    else             c = 'R';
+  } else {
+    if (r == 1)      c = 'R';
+    else if (s == 1) c = 'S';
+    else             c = 'L';
+  }
+
+  bool junction = (paths > 1);             // a plain bend is not recorded
+  if (junction) {
+    str += c;
+    decisionCount++;
+  }
+
+  if (c == 'R')      { botright(); heading = (heading + 1) & 3; }
+  else if (c == 'L') { botleft();  heading = (heading + 3) & 3; }
+  else if (junction) clearJunction();      // straight through a junction
+}
+
+// Turn letters as angles: S = 0, R = 90, U = 180, L = 270 degrees
+int turnAngle(char c) {
+  if (c == 'R') return 90;
+  if (c == 'U') return 180;
+  if (c == 'L') return 270;
+  return 0;
+}
+
+char angleToTurn(int a) {
+  a = a % 360;
+  if (a == 90)  return 'R';
+  if (a == 180) return 'U';
+  if (a == 270) return 'L';
+  return 'S';
+}
+
+// PATH SIMPLIFICATION: "xUy" (go in, dead end, come back out) is replaced
+// by the single turn that has the same total angle:  x + 180 + y.
+//   e.g. RUR -> S,  SUR -> L,  LUL -> S,  LUS -> R,  LUR -> U ...
+// Repeated until no 'U' is left. Works for both hands.
+void simplifyPath() {
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (int i = 1; i + 1 < (int)str.length(); i++) {
+      if (str.charAt(i) != 'U') continue;
+      char a = str.charAt(i - 1);
+      char b = str.charAt(i + 1);
+      if (a == 'E' || b == 'E' || a == 'U' || b == 'U') continue;
+      char n = angleToTurn(turnAngle(a) + 180 + turnAngle(b));
+      String t = str.substring(0, i - 1);
+      t += n;
+      t += str.substring(i + 2);
+      str = t;
+      changed = true;
+      break;
+    }
+  }
+}
+
+
+// =====================================================================
+//  SECTION 9 : ALGORITHMS 2, 3, 4  -  MAZE MAP + EXPLORATION
+// =====================================================================
+//  While exploring, the robot builds a MAP:
+//    - every junction / line end / END is a NODE
+//    - every line between two nodes is an EDGE, with its driving time
+//  Position is "dead reckoning": driving time in the current heading.
+//  When it comes back to a junction it has seen (a loop), it recognises
+//  it, so it never drives around a loop forever.
+//
+//  Exploration rule (Tremaux style):
+//    a) a new line pointing straight at a known junction? test that shortcut
+//    b) otherwise take an unexplored line (right-first or left-first)
+//    c) nothing new here? drive back to the nearest junction that still
+//       has an unexplored line
+//  Mode 2 stops at the END. Modes 3 and 4 keep going until EVERY line has
+//  been explored (they drive back out of the END zone if needed).
+// ---------------------------------------------------------------------
+
+bool fullExploreMode() {
+  return (algorithmMode == ALGO_TREMAUX || algorithmMode == ALGO_ASTAR);
+}
+
+uint8_t getArr(uint8_t n, uint8_t d) {
+  return (nodes[n].arrH >> (2 * d)) & 3;
+}
+
+// how far (ms) a position may be from node j and still be node j
+uint32_t nodeTol(uint8_t j) {
+  uint32_t seen = (uint32_t)nodes[j].seenOdo * 8UL;
+  uint32_t since = (odoMs > seen) ? (odoMs - seen) : 0;
+  uint32_t t = (uint32_t)NODE_TOL_MS + since * NODE_TOL_PCT / 100UL;
+  if (t > (uint32_t)NODE_TOL_MAX * NODE_TOL_MS) t = (uint32_t)NODE_TOL_MAX * NODE_TOL_MS;
+  return t;
+}
+
+void mapInit() {
+  nodeCount = 1;                       // node 0 = START (a line end)
+  nodes[0].px = 0;
+  nodes[0].py = 0;
+  nodes[0].exits = 1;                  // only line goes forward (direction 0)
+  nodes[0].type = NT_DEADEND;
+  for (uint8_t d = 0; d < 4; d++) {
+    nodes[0].nbr[d] = NO_NODE;
+    nodes[0].cost[d] = 0;
+  }
+  nodes[0].arrH = 0;
+  nodes[0].seenOdo = 0;
+  curNode = 0;
+  curExit = 0;
+  heading = 0;
+  endNode = NO_NODE;
+  posX = 0;
+  posY = 0;
+  odoMs = 0;
+  edgeMs = 0;
+  mapBroken = false;
+  verifyTarget = NO_NODE;
+  verifyOrigin = NO_NODE;
+  returnTo = NO_NODE;
+  verifyBent = false;
+  mappingActive = true;
+  segStartMs = millis();
+}
+
+void linkEdge(uint8_t a, uint8_t da, uint8_t b, uint8_t db, uint32_t c, uint8_t hArr) {
+  if (c > 60000UL) c = 60000UL;
+  if (nodes[a].nbr[da] == b) c = (c + nodes[a].cost[da]) / 2;   // driven before: average
+  nodes[a].nbr[da] = b;
+  nodes[a].cost[da] = (uint16_t)c;
+  nodes[a].arrH = (nodes[a].arrH & ~(3 << (2 * da))) | (hArr << (2 * da));
+  nodes[b].nbr[db] = a;
+  nodes[b].cost[db] = (uint16_t)c;
+  uint8_t hBack = (da + 2) & 3;
+  nodes[b].arrH = (nodes[b].arrH & ~(3 << (2 * db))) | (hBack << (2 * db));
+}
+
+// find (or create) the node the bot is standing on and connect the edge just driven
+uint8_t registerNode(uint8_t type, uint8_t ex, uint8_t back, bool *isNew) {
+  uint8_t n = NO_NODE;
+  *isNew = false;
+
+  // 1) we drove along an edge we already know -> we know where we are
+  if (curNode != NO_NODE && nodes[curNode].nbr[curExit] != NO_NODE) {
+    uint8_t k = nodes[curNode].nbr[curExit];
+    if (nodes[k].type == type) n = k;
+  }
+
+  // 2) new edge: did it bring us back to a junction we have seen (loop closed)?
+  if (n == NO_NODE) {
+    uint32_t best = 0xFFFFFFFFUL;
+    for (uint8_t j = 0; j < nodeCount; j++) {
+      if (nodes[j].type != type || nodes[j].exits != ex) continue;
+      if (nodes[j].nbr[back] != NO_NODE) continue;      // that side already leads elsewhere
+      if (j == curNode && back == curExit) continue;
+      int32_t dx = posX - nodes[j].px; if (dx < 0) dx = -dx;
+      int32_t dy = posY - nodes[j].py; if (dy < 0) dy = -dy;
+      uint32_t dd = (uint32_t)((dx > dy) ? dx : dy);
+      if (dd <= nodeTol(j) && dd < best) {
+        best = dd;
+        n = j;
+      }
+    }
+  }
+
+  if (n == NO_NODE) {                                   // 3) brand new node
+    if (nodeCount >= MAX_NODES) return NO_NODE;
+    n = nodeCount++;
+    if (posX > 32000) posX = 32000;
+    if (posX < -32000) posX = -32000;
+    if (posY > 32000) posY = 32000;
+    if (posY < -32000) posY = -32000;
+    nodes[n].px = (int16_t)posX;
+    nodes[n].py = (int16_t)posY;
+    nodes[n].exits = ex;
+    nodes[n].type = type;
+    for (uint8_t d = 0; d < 4; d++) {
+      nodes[n].nbr[d] = NO_NODE;
+      nodes[n].cost[d] = 0;
+    }
+    nodes[n].arrH = 0;
+    *isNew = true;
+  } else {
+    posX = nodes[n].px;                                 // re-anchor: removes drift
+    posY = nodes[n].py;
+  }
+  nodes[n].seenOdo = (uint16_t)(odoMs / 8UL);
+  if (curNode != NO_NODE) linkEdge(curNode, curExit, n, back, edgeMs, heading);
+  return n;
+}
+
+// Is there still an unexplored line anywhere in the map?
+bool explorationComplete() {
+  for (uint8_t j = 0; j < nodeCount; j++) {
+    if (nodes[j].type != NT_JUNCTION) continue;
+    for (uint8_t d = 0; d < 4; d++) {
+      if ((nodes[j].exits & (1 << d)) && nodes[j].nbr[d] == NO_NODE) return false;
+    }
+  }
+  return true;
+}
+
+// shortest known driving time between two nodes (to == NO_NODE: nearest node that
+// still has an unexplored line). firstExit = exit to take from 'from'.
+uint32_t graphDist(uint8_t from, uint8_t to, uint8_t *firstExit) {
+  uint32_t dist[MAX_NODES];
+  uint8_t first[MAX_NODES];
+  uint8_t done[MAX_NODES];
+  for (uint8_t i = 0; i < MAX_NODES; i++) {
+    dist[i] = 0xFFFFFFFFUL;
+    first[i] = NO_NODE;
+    done[i] = 0;
+  }
+  dist[from] = 0;
+  *firstExit = NO_NODE;
+  uint8_t pick = NO_NODE;          // frontier mode: most recently visited unfinished junction
+
+  while (true) {
+    uint8_t un = NO_NODE;
+    uint32_t bd = 0xFFFFFFFFUL;
+    for (uint8_t i = 0; i < nodeCount; i++) {
+      if (!done[i] && dist[i] < bd) {
+        bd = dist[i];
+        un = i;
+      }
+    }
+    if (un == NO_NODE) {
+      if (to == NO_NODE && pick != NO_NODE) {
+        *firstExit = first[pick];
+        return dist[pick];
+      }
+      return 0xFFFFFFFFUL;
+    }
+    done[un] = 1;
+
+    if (un != from) {
+      if (to == NO_NODE) {
+        if (nodes[un].type == NT_JUNCTION) {
+          for (uint8_t d = 0; d < 4; d++) {
+            if ((nodes[un].exits & (1 << d)) && nodes[un].nbr[d] == NO_NODE) {
+              // backtrack like Tremaux: prefer the junction we left most recently
+              if (pick == NO_NODE || nodes[un].seenOdo > nodes[pick].seenOdo) pick = un;
+              break;
+            }
+          }
+        }
+      } else if (un == to) {
+        *firstExit = first[un];
+        return bd;
+      }
+      if (nodes[un].type != NT_JUNCTION) continue;    // can't drive through a line end
+    }
+
+    for (uint8_t d = 0; d < 4; d++) {
+      uint8_t v = nodes[un].nbr[d];
+      if (v == NO_NODE || done[v]) continue;
+      uint32_t nd = bd + nodes[un].cost[d] + JUNCTION_COST_MS;
+      if (nd < dist[v]) {
+        dist[v] = nd;
+        first[v] = (un == from) ? d : first[un];
+      }
+    }
+  }
+}
+
+// is node m straight ahead of node n in direction d?
+bool aheadAligned(uint8_t n, uint8_t d, uint8_t m) {
+  int32_t rx = (int32_t)nodes[m].px - nodes[n].px;
+  int32_t ry = (int32_t)nodes[m].py - nodes[n].py;
+  int32_t along = rx * DIRX[d] + ry * DIRY[d];
+  int32_t perp = rx * DIRY[d] - ry * DIRX[d];
+  if (perp < 0) perp = -perp;
+  return along > (int32_t)NODE_TOL_MS && perp <= (int32_t)ALIGN_TOL_MS;
+}
+
+// unexplored exit d of node n points straight at a known junction whose
+// facing line is also unexplored, and the known way round is much longer.
+// returns that junction, or NO_NODE
+uint8_t shortcutTarget(uint8_t n, uint8_t d) {
+  uint8_t m = NO_NODE;
+  int32_t bestAlong = 0x7FFFFFFFL;
+  for (uint8_t j = 0; j < nodeCount; j++) {
+    if (j == n) continue;
+    int32_t rx = (int32_t)nodes[j].px - nodes[n].px;
+    int32_t ry = (int32_t)nodes[j].py - nodes[n].py;
+    int32_t along = rx * DIRX[d] + ry * DIRY[d];
+    int32_t perp = rx * DIRY[d] - ry * DIRX[d];
+    if (perp < 0) perp = -perp;
+    if (along <= (int32_t)NODE_TOL_MS) continue;
+    if (perp > (int32_t)ALIGN_TOL_MS) continue;
+    if (along < bestAlong) {
+      bestAlong = along;
+      m = j;
+    }
+  }
+  if (m == NO_NODE) return NO_NODE;
+  uint8_t facing = (d + 2) & 3;
+  if (nodes[m].type != NT_JUNCTION) return NO_NODE;
+  if (!(nodes[m].exits & (1 << facing))) return NO_NODE;
+  if (nodes[m].nbr[facing] != NO_NODE) return NO_NODE;
+  uint8_t fe;
+  uint32_t known = graphDist(n, m, &fe);
+  if (known == 0xFFFFFFFFUL) return m;
+  if (known * 10UL > (uint32_t)bestAlong * SHORTCUT_RATIO) return m;
+  return NO_NODE;
+}
+
+// pick the absolute direction to leave node n
+uint8_t chooseExit(uint8_t n) {
+  uint8_t back = (heading + 2) & 3;
+  uint8_t fe = NO_NODE;
+
+  if (nodes[n].type != NT_JUNCTION) {                          // line end: U-turn
+    if (verifyTarget != NO_NODE) {                             // short-cut test failed
+      returnTo = verifyOrigin;
+      verifyTarget = NO_NODE;
+    }
+    return back;
+  }
+
+  // testing a short cut?
+  if (verifyTarget != NO_NODE) {
+    if (n == verifyTarget) {
+      verifyTarget = NO_NODE;                                  // confirmed: loop closed
+    } else if (!verifyBent && (nodes[n].exits & (1 << heading)) && aheadAligned(n, heading, verifyTarget)) {
+      return heading;                                          // junction on the way: keep straight
+    } else {
+      returnTo = verifyOrigin;                                 // not a short cut: go back
+      verifyTarget = NO_NODE;
+    }
+  }
+
+  // going back to where a failed short-cut test started
+  if (returnTo != NO_NODE) {
+    if (n == returnTo) {
+      returnTo = NO_NODE;
+    } else if (graphDist(n, returnTo, &fe) != 0xFFFFFFFFUL && fe != NO_NODE) {
+      return fe;
+    } else {
+      returnTo = NO_NODE;
+    }
+  }
+
+  // exploration priority: right-first or left-first
+  uint8_t order[3];
+  if (useLeftHand()) {
+    order[0] = (heading + 3) & 3;                              // left
+    order[1] = heading;                                        // straight
+    order[2] = (heading + 1) & 3;                              // right
+  } else {
+    order[0] = (heading + 1) & 3;                              // right
+    order[1] = heading;                                        // straight
+    order[2] = (heading + 3) & 3;                              // left
+  }
+  uint8_t ex = nodes[n].exits;
+
+  // a) an unexplored line that may be a short cut through a loop
+  for (uint8_t i = 0; i < 3; i++) {
+    uint8_t d = order[i];
+    if ((ex & (1 << d)) && nodes[n].nbr[d] == NO_NODE) {
+      uint8_t m = shortcutTarget(n, d);
+      if (m != NO_NODE) {
+        verifyTarget = m;
+        verifyOrigin = n;
+        verifyBent = false;
+        return d;
+      }
+    }
+  }
+  // b) an unexplored line, in priority order
+  for (uint8_t i = 0; i < 3; i++) {
+    uint8_t d = order[i];
+    if ((ex & (1 << d)) && nodes[n].nbr[d] == NO_NODE) return d;
+  }
+  // c) everything here explored: go back to the last junction that still has an unexplored line
+  if (graphDist(n, NO_NODE, &fe) != 0xFFFFFFFFUL && fe != NO_NODE) return fe;
+  // d) fallback: plain wall following
+  for (uint8_t i = 0; i < 3; i++) {
+    if (ex & (1 << order[i])) return order[i];
+  }
+  return back;
+}
+
+// turn at the current node to absolute direction d (ex = lines seen here)
+void turnToDir(uint8_t d, uint8_t ex) {
+  uint8_t rel = (d - heading) & 3;
+  if (rel == 1) {
+    botright();
+  } else if (rel == 3) {
+    botleft();
+  } else if (rel == 2) {
+    if (u == 1) botuturn();                                     // line end: U-turn
+    else if (!(ex & (1 << ((heading + 1) & 3)))) botright();    // no line on the right: next line is the way back
+    else if (!(ex & (1 << ((heading + 3) & 3)))) botleft();     // no line on the left
+    else spinRightLines(2);                                      // pass the right line, stop on the way back
+  }
+  heading = d;
+}
+
+// Dry run finished: stop and blink both LEDs
+void finishDryRun() {
+  endFound = 1;
+  motor1.brake();
+  motor2.brake();
+  delay(80);
+  botstop();
+  endBlink();
+}
+
+// Modes 3/4: drive backwards out of the END zone, then U-turn on the line
+void backOutOfEnd() {
+  unsigned long t0 = millis();
+  while ((readS(0) < threshold[0] || readS(4) < threshold[4]) &&
+         millis() - t0 < 2000) {                     // until outer sensors leave the END zone
+    motor1.drive(-turnspeed);
+    motor2.drive(-turnspeed);
+  }
+  t0 = millis();
+  while (millis() - t0 < END_BACKOUT_MS) {           // a little more, to clear the zone
+    motor1.drive(-turnspeed);
+    motor2.drive(-turnspeed);
+  }
+  botstop();
+  delay(50);
+  botuturn();                                        // turn around on the entry line
+}
+
+// dry-run decision at every node (called from reposition())
+void mapReposition() {
+  uint32_t now = millis();
+  uint32_t dt = now - segStartMs;
+  posX += (int32_t)DIRX[heading] * (int32_t)dt;
+  posY += (int32_t)DIRY[heading] * (int32_t)dt;
+  odoMs += dt;
+  edgeMs += dt;
+
+  uint8_t back = (heading + 2) & 3;
+  bool isNew;
+
+  // ---- END zone ----
+  if (e == 2) {
+    endNode = registerNode(NT_END, (uint8_t)(1 << back), back, &isNew);
+    if (endNode == NO_NODE) { mapBroken = true; str += 'E'; finishDryRun(); return; }
+    if (!fullExploreMode() || explorationComplete()) {
+      str += 'E';
+      finishDryRun();                                  // mode 2 always stops here
+      return;
+    }
+    // modes 3/4: more to explore -> leave the END zone the way we came in
+    backOutOfEnd();
+    heading = back;
+    curNode = endNode;
+    curExit = back;
+    edgeMs = 0;
+    segStartMs = millis();
+    return;
+  }
+
+  // ---- plain bend: not a decision point ----
+  if (u == 0 && paths <= 1) {
+    if (verifyTarget != NO_NODE && (r == 1 || l == 1)) verifyBent = true;
+    if (r == 1) {
+      botright();
+      heading = (heading + 1) & 3;
+      edgeMs += CORNER_COST_MS;
+    } else if (s == 1) {
+    } else if (l == 1) {
+      botleft();
+      heading = (heading + 3) & 3;
+      edgeMs += CORNER_COST_MS;
+    }
+    segStartMs = millis();
+    return;
+  }
+
+  // ---- junction or line end ----
+  uint8_t ex = (uint8_t)(1 << back);
+  if (u == 0) {
+    if (s == 1) ex |= (1 << heading);
+    if (r == 1) ex |= (1 << ((heading + 1) & 3));
+    if (l == 1) ex |= (1 << ((heading + 3) & 3));
+  }
+
+  uint8_t n = registerNode(u ? NT_DEADEND : NT_JUNCTION, ex, back, &isNew);
+  if (n == NO_NODE) {            // map memory full
+    if (endNode != NO_NODE) {    // END already known: stop and plan with the map so far
+      Serial.println(F("MAP FULL - planning with the map so far"));
+      finishDryRun();
+      return;
+    }
+    mapBroken = true;            // END not found yet: carry on as a plain wall follower
+    mappingActive = false;
+    Serial.println(F("MAP FULL - continuing as wall follower"));
+    wallFollowerStep();
+    return;
+  }
+
+  if (u == 0) decisionCount++;
+  if (decisionCount > MAX_DECISIONS) {          // safety stop
+    dryRunFailed = (endNode == NO_NODE);
+    finishDryRun();
+    return;
+  }
+
+  // modes 3/4: everything explored and END known -> dry run finished
+  if (fullExploreMode() && endNode != NO_NODE && explorationComplete()) {
+    finishDryRun();
+    return;
+  }
+
+  uint8_t d = chooseExit(n);
+  if (!(ex & (1 << d))) {        // safety: only ever turn onto a line we can see
+    if (r == 1) d = (heading + 1) & 3;
+    else if (s == 1) d = heading;
+    else if (l == 1) d = (heading + 3) & 3;
+    else d = back;
+  }
+
+  uint8_t rel = (d - heading) & 3;
+  if (u == 1) str += 'U';                     // raw record (only used if planning fails)
+  else if (paths > 1) str += "SRUL"[rel];
+
+  turnToDir(d, ex);
+  if (u == 0 && rel == 0) clearJunction();    // straight through a junction -> clear it
+  curNode = n;
+  curExit = d;
+  edgeMs = 0;
+  segStartMs = millis();
+}
+
+
+// =====================================================================
+//  SECTION 10 : PLANNERS  -  DIJKSTRA  and  A*
+// =====================================================================
+//  The search works on STATES = (node, heading when arriving), because a
+//  turn costs more time than going straight. Cost of one move:
+//      driving time of the line + junction cost + turn cost (if L or R)
+//  No U-turns are allowed in the final run.
+//
+//  DIJKSTRA : always expands the state with the smallest cost so far.
+//  A*       : expands the state with the smallest  cost + hint,
+//             hint = straight-line (Manhattan) distance to the END.
+//             The hint never over-estimates, so the answer is the same
+//             as Dijkstra, but usually fewer states are looked at.
+//  The result is written into `str` as L / S / R letters + 'E'.
+// ---------------------------------------------------------------------
+bool planShortestPath(bool useAStar) {
+  if (mapBroken || endNode == NO_NODE) return false;
+  const uint8_t NS = MAX_NODES * 4;          // state = node*4 + arrival heading
+  uint16_t dist[NS];                         // units of 4 ms
+  uint8_t prev[NS];
+  uint8_t done[(NS + 7) / 8];
+  for (uint8_t i = 0; i < NS; i++) {
+    dist[i] = 0xFFFF;
+    prev[i] = 0xFF;
+  }
+  for (uint8_t i = 0; i < (NS + 7) / 8; i++) done[i] = 0;
+
+  uint8_t b = nodes[0].nbr[0];
+  if (b == NO_NODE) return false;
+  uint8_t s0 = b * 4 + getArr(0, 0);
+  dist[s0] = nodes[0].cost[0] / 4;
+  prev[s0] = 0xFE;
+  uint8_t goal = 0xFF;
+  uint8_t ns = nodeCount * 4;
+  plannerSteps = 0;
+
+  while (true) {
+    // ---- pick the next state to expand ----
+    uint8_t us = 0xFF;
+    uint32_t bestKey = 0xFFFFFFFFUL;
+    for (uint8_t i = 0; i < ns; i++) {
+      if ((done[i >> 3] & (1 << (i & 7))) || dist[i] == 0xFFFF) continue;
+      uint32_t key = dist[i];
+      if (useAStar) {                                   // A*: add the hint
+        uint8_t n = i >> 2;
+        int32_t dx = (int32_t)nodes[n].px - nodes[endNode].px; if (dx < 0) dx = -dx;
+        int32_t dy = (int32_t)nodes[n].py - nodes[endNode].py; if (dy < 0) dy = -dy;
+        key += (uint32_t)(dx + dy) * ASTAR_HINT_PCT / 100UL / 4UL;
+      }
+      if (key < bestKey) {
+        bestKey = key;
+        us = i;
+      }
+    }
+    if (us == 0xFF) break;
+    done[us >> 3] |= (1 << (us & 7));
+    plannerSteps++;
+    uint16_t bd = dist[us];
+    uint8_t n = us >> 2, h = us & 3;
+    if (n == endNode) {
+      goal = us;
+      break;
+    }
+    if (nodes[n].type != NT_JUNCTION) continue;
+    // ---- relax every line leaving this junction ----
+    for (uint8_t d = 0; d < 4; d++) {
+      uint8_t v = nodes[n].nbr[d];
+      if (v == NO_NODE) continue;
+      uint8_t rel = (d - h) & 3;
+      if (rel == 2) continue;                // no U-turns in the final run
+      uint32_t c = (uint32_t)bd + ((uint32_t)nodes[n].cost[d] + JUNCTION_COST_MS + (rel ? TURN_COST_MS : 0)) / 4;
+      if (c > 0xFFFE) c = 0xFFFE;
+      uint8_t vs = v * 4 + getArr(n, d);
+      if (c < dist[vs] && !(done[vs >> 3] & (1 << (vs & 7)))) {
+        dist[vs] = (uint16_t)c;
+        prev[vs] = us;
+      }
+    }
+  }
+  if (goal == 0xFF) return false;
+
+  // ---- walk back from the END and write the letters ----
+  char buf[MAX_NODES * 2 + 2];
+  uint8_t len = 0;
+  uint8_t v = goal;
+  while (prev[v] != 0xFE) {
+    uint8_t us = prev[v];
+    uint8_t n = us >> 2, h = us & 3;
+    char c = 0;
+    for (uint8_t d = 0; d < 4; d++) {
+      if (nodes[n].nbr[d] == (v >> 2) && getArr(n, d) == (v & 3)) {
+        c = "SRUL"[(d - h) & 3];
+        break;
+      }
+    }
+    if (c == 0 || len >= sizeof(buf) - 1) return false;
+    buf[len++] = c;
+    v = us;
+  }
+
+  str = "";
+  for (uint8_t i = len; i > 0; i--) str += buf[i - 1];
+  str += 'E';
+  return true;
+}
+
+void printMap() {
+  Serial.print(F("NODES "));
+  Serial.println(nodeCount);
+  for (uint8_t i = 0; i < nodeCount; i++) {
+    Serial.print(i);
+    Serial.print(F(" t"));
+    Serial.print(nodes[i].type);
+    Serial.print(F(" ("));
+    Serial.print(nodes[i].px);
+    Serial.print(',');
+    Serial.print(nodes[i].py);
+    Serial.print(F(") "));
+    for (uint8_t d = 0; d < 4; d++) {
+      if (nodes[i].exits & (1 << d)) {
+        if (nodes[i].nbr[d] == NO_NODE) Serial.print('?');
+        else Serial.print(nodes[i].nbr[d]);
+      } else Serial.print('-');
+      Serial.print(' ');
+    }
+    Serial.println();
+  }
+}
+
+
+// =====================================================================
+//  SECTION 11 : DRY RUN, FINAL RUN, setup(), loop()
+// =====================================================================
+
+// Called at every junction / bend / dead end during the dry run
+void reposition() {
+  lightsoff();
+  if (mappingActive) mapReposition();     // algorithms 2, 3, 4
+  else               wallFollowerStep();  // algorithms 0, 1
+}
+
+// DRY RUN: explore the maze with the selected algorithm
+void dryRun() {
+  str = "";
+  endFound = 0;
+  dryRunFailed = false;
+  decisionCount = 0;
+  heading = 0;
+  mappingActive = false;
+  mapBroken = false;
+  if (algorithmMode >= ALGO_DIJKSTRA) mapInit();
+
+  while (endFound == 0) {
+    linefollow();
+    checknode();
+    reposition();
+    if (!mappingActive && decisionCount > MAX_DECISIONS) {   // wall follower stuck in a loop
+      dryRunFailed = true;
+      botstop();
+      Serial.println(F("DRY RUN STOPPED: too many decisions (loop?)"));
+      break;
+    }
+  }
+  mappingActive = false;
+  buildFinalPath();
+}
+
+// Turn what the dry run learned into the final path string
+void buildFinalPath() {
+  Serial.print(F("ALGORITHM "));
+  Serial.println(algorithmMode);
+  Serial.print(F("DRY RUN RECORD "));
+  Serial.println(str);
+
+  if (algorithmMode >= ALGO_DIJKSTRA && !mapBroken) {
+#if MAP_DEBUG
+    printMap();
+#endif
+    bool ok = planShortestPath(algorithmMode == ALGO_ASTAR);
+    Serial.print(algorithmMode == ALGO_ASTAR ? F("A* steps ") : F("DIJKSTRA steps "));
+    Serial.println(plannerSteps);
+    if (!ok) {
+      Serial.println(F("PLANNING FAILED"));
+      if (fullExploreMode()) dryRunFailed = true;   // raw record of a full exploration is not a path
+      else simplifyPath();
+    }
+  } else {
+    simplifyPath();                                 // wall followers (or map full)
+  }
+
+  if (str.indexOf('E') < 0 || str.indexOf('U') >= 0) dryRunFailed = true;
+  Serial.print(F("FINAL PATH "));
+  Serial.println(str);
+  if (dryRunFailed) {
+    Serial.println(F("NO VALID PATH - check Serial output, recalibrate, try again"));
+    errorBlink();
+  }
+}
+
+// FINAL RUN: follow the path string. Plain bends are followed
+// automatically; one letter is used at every real junction.
+void finalRun() {
+  if (dryRunFailed) {
+    errorBlink();
+    return;
+  }
+  int endpos = str.indexOf('E');
+
+  for (int i = 0; i <= endpos; i++) {
+    char node = str.charAt(i);
+    paths = 0;
+    while (paths < 2) {                       // drive to the next junction
+      linefollow();
+      checknode();
+      if (paths == 1) followCorner();         // plain bend: just take it
+    }
+
+    switch (node) {
+      case 'L':
+        botstop();
+        delay(50);
+        botleft();
+        break;
+
+      case 'S':
+        clearJunction();
+        break;
+
+      case 'R':
+        botstop();
+        delay(50);
+        botright();
+        break;
+
+      case 'E':
+        botstop();
+        endBlink();
+        break;
+    }
+  }
+  botstop();
+}
+
+void setup() {
+  Serial.begin(9600);
+
+  motor1.begin();
+  motor2.begin();
+
+  pinMode(CALIB_BTN, INPUT_PULLUP);
+  pinMode(START_BTN, INPUT_PULLUP);
+  pinMode(LED5, OUTPUT);
+  pinMode(LED6, OUTPUT);
+  lightsoff();
+
+  pinMode(IMPELLER_PIN, OUTPUT);
+  analogWrite(IMPELLER_PIN, 0);
+
+  if (algorithmMode < 0 || algorithmMode > 4) algorithmMode = ALGO_DIJKSTRA;   // safety
+
+  Serial.println(mode == 1 ? F("ARENA: BLACK line on WHITE") : F("ARENA: WHITE line on BLACK"));
+  Serial.print(F("ALGORITHM MODE "));
+  Serial.println(algorithmMode);
+  Serial.println(F("Ready - press CALIB"));
+}
+
+void loop() {
+  // ---------- 1) CALIBRATION (CALIB button) ----------
+  waitPress(CALIB_BTN);
+  delay(1000);
+  calib();
+  analogWrite(IMPELLER_PIN, IMPELLER_PWM);
+
+  // ---------- 2) DRY RUN (START button) ----------
+  if (endFound == 0) {
+    waitPress(START_BTN);
+    delay(1000);
+    dryRun();
+  }
+
+  // ---------- 3) FINAL RUN(S) ----------
+  // START = run the path (again), CALIB = re-calibrate sensors
+  while (true) {
+    uint8_t b = waitAnyPress();
+    if (b == CALIB_BTN) {
+      analogWrite(IMPELLER_PIN, 0);
+      delay(1000);
+      calib();
+      analogWrite(IMPELLER_PIN, IMPELLER_PWM);
+      continue;
+    }
+    lightsoff();
+    delay(1000);
+    finalRun();
+  }
+}
